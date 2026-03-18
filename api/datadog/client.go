@@ -200,9 +200,25 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 			log.Printf("\n%s\n", string(dump))
 		}
 
-		retryDuration, shouldRetry := c.shouldRetryRequest(resp, retryCount)
+		retryDuration, shouldRetry, isRateLimit := c.shouldRetryRequest(resp, retryCount)
 		if !shouldRetry {
 			return resp, requestErr
+		}
+
+		if isRateLimit {
+			// Rate-limit waits are deliberate backoff, not hung connections.
+			// Wait without the retry timeout context so we don't abort a
+			// perfectly healthy pagination sequence.
+			select {
+			case <-request.Context().Done():
+				return resp, requestErr
+			case <-time.After(*retryDuration):
+				// Reset the retry timeout for the next request.
+				ccancel()
+				ctx, ccancel = context.WithTimeout(request.Context(), c.Cfg.RetryConfiguration.HTTPRetryTimeout)
+				retryCount++
+				continue
+			}
 		}
 
 		select {
@@ -216,19 +232,20 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 	}
 }
 
-// Determine if a request should be retried
-func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) (*time.Duration, bool) {
+// Determine if a request should be retried.
+// Returns the duration to wait, whether to retry, and whether this is a rate-limit retry.
+func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) (*time.Duration, bool, bool) {
 	enableRetry := c.Cfg.RetryConfiguration.EnableRetry
 	maxRetries := c.Cfg.RetryConfiguration.MaxRetries
 	if !enableRetry || retryCount == maxRetries {
-		return nil, false
+		return nil, false, false
 	}
 	var err error
 	if v := response.Header.Get(rateLimitResetHeader); response.StatusCode == 429 && v != "" {
 		vInt, err := strconv.ParseInt(v, 10, 64)
 		if err == nil {
 			retryDuration := time.Duration(vInt) * time.Second
-			return &retryDuration, true
+			return &retryDuration, true, true
 		}
 	}
 
@@ -240,9 +257,9 @@ func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) 
 		// retry duration shouldn't exceed default timeout period
 		retryVal = math.Min(float64(c.Cfg.HTTPClient.Timeout/time.Second), retryVal)
 		retryDuration := time.Duration(retryVal) * time.Second
-		return &retryDuration, true
+		return &retryDuration, true, response.StatusCode == 429
 	}
-	return nil, false
+	return nil, false, false
 }
 
 // GetConfig allows modification of underlying config for alternate implementations and testing.
