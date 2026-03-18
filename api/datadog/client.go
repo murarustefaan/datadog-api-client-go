@@ -163,14 +163,17 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 		rawBody, _ = io.ReadAll(request.Body)
 		request.Body.Close()
 	}
-	ctx, ccancel := context.WithTimeout(request.Context(), c.Cfg.RetryConfiguration.HTTPRetryTimeout)
-	defer ccancel()
 	retryCount := 0
 	for {
-		newRequest := copyRequest(request, &rawBody)
+		// HTTPRetryTimeout scopes to this single round-trip, protecting
+		// against hung connections. Retry waits happen outside this context
+		// and are bounded by MaxRetries instead.
+		reqCtx, reqCancel := context.WithTimeout(request.Context(), c.Cfg.RetryConfiguration.HTTPRetryTimeout)
+		newRequest := copyRequest(request, &rawBody).WithContext(reqCtx)
 		if c.Cfg.Debug {
 			dump, err := httputil.DumpRequestOut(newRequest, true)
 			if err != nil {
+				reqCancel()
 				return nil, err
 			}
 			// Strip any api keys from the response being logged
@@ -184,6 +187,7 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 			log.Printf("\n%s\n", string(dump))
 		}
 		resp, requestErr := c.Cfg.HTTPClient.Do(newRequest)
+		reqCancel()
 
 		if requestErr != nil {
 			return resp, requestErr
@@ -200,52 +204,36 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 			log.Printf("\n%s\n", string(dump))
 		}
 
-		retryDuration, shouldRetry, isRateLimit := c.shouldRetryRequest(resp, retryCount)
+		retryDuration, shouldRetry := c.shouldRetryRequest(resp, retryCount)
 		if !shouldRetry {
 			return resp, requestErr
 		}
 
-		if isRateLimit {
-			// Rate-limit waits are deliberate backoff, not hung connections.
-			// Wait without the retry timeout context so we don't abort a
-			// perfectly healthy pagination sequence.
-			select {
-			case <-request.Context().Done():
-				return resp, requestErr
-			case <-time.After(*retryDuration):
-				// Reset the retry timeout for the next request.
-				ccancel()
-				ctx, ccancel = context.WithTimeout(request.Context(), c.Cfg.RetryConfiguration.HTTPRetryTimeout)
-				retryCount++
-				continue
-			}
-		}
-
+		// Wait for retry. Only the caller's context can cancel this —
+		// HTTPRetryTimeout intentionally does not apply to retry waits.
 		select {
-		case <-ctx.Done():
+		case <-request.Context().Done():
 			return resp, requestErr
 		case <-time.After(*retryDuration):
 			retryCount++
 			continue
 		}
-
 	}
 }
 
-// Determine if a request should be retried.
-// Returns the duration to wait, whether to retry, and whether this is a rate-limit retry.
-func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) (*time.Duration, bool, bool) {
+// shouldRetryRequest determines if a request should be retried and for how long.
+func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) (*time.Duration, bool) {
 	enableRetry := c.Cfg.RetryConfiguration.EnableRetry
 	maxRetries := c.Cfg.RetryConfiguration.MaxRetries
 	if !enableRetry || retryCount == maxRetries {
-		return nil, false, false
+		return nil, false
 	}
 	var err error
 	if v := response.Header.Get(rateLimitResetHeader); response.StatusCode == 429 && v != "" {
 		vInt, err := strconv.ParseInt(v, 10, 64)
 		if err == nil {
 			retryDuration := time.Duration(vInt) * time.Second
-			return &retryDuration, true, true
+			return &retryDuration, true
 		}
 	}
 
@@ -257,9 +245,9 @@ func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) 
 		// retry duration shouldn't exceed default timeout period
 		retryVal = math.Min(float64(c.Cfg.HTTPClient.Timeout/time.Second), retryVal)
 		retryDuration := time.Duration(retryVal) * time.Second
-		return &retryDuration, true, response.StatusCode == 429
+		return &retryDuration, true
 	}
-	return nil, false, false
+	return nil, false
 }
 
 // GetConfig allows modification of underlying config for alternate implementations and testing.
