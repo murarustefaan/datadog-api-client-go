@@ -163,14 +163,17 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 		rawBody, _ = io.ReadAll(request.Body)
 		request.Body.Close()
 	}
-	ctx, ccancel := context.WithTimeout(request.Context(), c.Cfg.RetryConfiguration.HTTPRetryTimeout)
-	defer ccancel()
 	retryCount := 0
 	for {
-		newRequest := copyRequest(request, &rawBody)
+		// HTTPRetryTimeout scopes to this single round-trip, protecting
+		// against hung connections. Retry waits happen outside this context
+		// and are bounded by MaxRetries instead.
+		reqCtx, reqCancel := context.WithTimeout(request.Context(), c.Cfg.RetryConfiguration.HTTPRetryTimeout)
+		newRequest := copyRequest(request, &rawBody).WithContext(reqCtx)
 		if c.Cfg.Debug {
 			dump, err := httputil.DumpRequestOut(newRequest, true)
 			if err != nil {
+				reqCancel()
 				return nil, err
 			}
 			// Strip any api keys from the response being logged
@@ -184,6 +187,7 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 			log.Printf("\n%s\n", string(dump))
 		}
 		resp, requestErr := c.Cfg.HTTPClient.Do(newRequest)
+		reqCancel()
 
 		if requestErr != nil {
 			return resp, requestErr
@@ -205,18 +209,19 @@ func (c *APIClient) CallAPI(request *http.Request) (*http.Response, error) {
 			return resp, requestErr
 		}
 
+		// Wait for retry. Only the caller's context can cancel this —
+		// HTTPRetryTimeout intentionally does not apply to retry waits.
 		select {
-		case <-ctx.Done():
+		case <-request.Context().Done():
 			return resp, requestErr
 		case <-time.After(*retryDuration):
 			retryCount++
 			continue
 		}
-
 	}
 }
 
-// Determine if a request should be retried
+// shouldRetryRequest determines if a request should be retried and for how long.
 func (c *APIClient) shouldRetryRequest(response *http.Response, retryCount int) (*time.Duration, bool) {
 	enableRetry := c.Cfg.RetryConfiguration.EnableRetry
 	maxRetries := c.Cfg.RetryConfiguration.MaxRetries
